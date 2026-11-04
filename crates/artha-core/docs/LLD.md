@@ -473,7 +473,12 @@ impl<T: TypedTool> Tool for Typed<T> { /* … */ }
 pub enum CoreEvent {
     // ── session ───────────────────────────────────────────────────────────
     /// First event on every receiver. `history` = number of messages loaded (0 for new).
-    SessionOpened { session: Option<data::SessionId>, resumed: bool, history: usize, workdir: PathBuf },
+    SessionOpened { session: Option<data::SessionId>, resumed: bool, history: usize, workdir: PathBuf,
+                     model: Option<String>, permission_mode: PermissionMode },
+    /// Emitted once the automatic title is assigned after the first turn, or after `rename`/`set_provider`.
+    TitleSet { title: String },
+    /// Provider/model switched mid-session (e.g. a `/model` command). Resolves the §6.3 "provider on resume" item.
+    ProviderChanged { provider: Option<String>, model: Option<String> },
     /// The DB row was created lazily on the first submit.
     SessionPersisted { session: data::SessionId },
     Notice(Notice),
@@ -1065,6 +1070,7 @@ pub(crate) struct Session {
     pub entries: Vec<EntryMeta>,
     pub grants: Grants,
     pub pending_notices: Vec<Notice>,          // BackgroundFinished/Failed awaiting the next user turn
+    pub active_background: HashMap<String, (BackgroundTicket, CancellationToken)>, // in-process tickets; removed on join_next completion
     pub usage: UsageTotals,
     pub unsynced: Vec<usize>,                  // indices into messages not yet persisted
     pub next_turn: u64,
@@ -1315,11 +1321,42 @@ impl SessionHandle {
     /// Background completion from outside (artha-jobs) or from core's own task set.
     pub async fn notify(&self, notice: Notice) -> Result<()>;
     pub async fn rename(&self, title: String) -> Result<()>;
+    /// Switches provider/model mid-session (e.g. a `/model` command). Persists via
+    /// `SessionStore::update_provider` and emits `CoreEvent::ProviderChanged`.
+    pub async fn set_provider(&self, provider: Option<String>, model: Option<String>) -> Result<()>;
+    /// Replays the in-memory history as UI-renderable turns — no DB round-trip, since
+    /// the actor already loaded it on open. For `-c`/`-r` so a UI can render prior
+    /// turns and offer `/rewind` targets, which `SessionOpened`'s `history: usize`
+    /// count alone can't support.
+    pub async fn history(&self) -> Result<Vec<HistoryTurn>>;
+    /// In-process background tickets still running for this session (durable
+    /// `artha-jobs` tickets aren't tracked here — list those through `artha-jobs`).
+    pub async fn list_background(&self) -> Result<Vec<BackgroundTicket>>;
+    /// Cancels an in-process background ticket. `Ok(false)` if it already finished
+    /// or doesn't belong to this session; durable tickets must be cancelled through `artha-jobs`.
+    pub async fn cancel_background(&self, id: &str) -> Result<bool>;
     /// Finishes the current turn (it is not cancelled), flushes unsynced messages, cancels background
     /// tasks, and stops the actor.
     pub async fn close(self) -> Result<()>;
     pub fn session_id(&self) -> Option<data::SessionId>;
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryTurn {
+    pub seq: data::MessageSeq,
+    pub role: llm::Role,
+    pub text: Option<String>,
+    pub tool_calls: Vec<ToolCallView>,
+    pub tool_outcomes: Vec<(CallId, ToolOutcome)>,
+    pub usage: Option<llm::Usage>,
+    pub created_at: data::Timestamp,
+}
+
+/// `Session::render_history(&self) -> Vec<HistoryTurn>` (§7) walks `messages`/`entries`
+/// pairwise — one `HistoryTurn` per stored message, tool_use/tool_result blocks split
+/// into `tool_calls`/`tool_outcomes`, `EntryMeta::synthetic` rounds kept so a crashed
+/// round still renders — and is pure/sync: no DB or network access, since both vectors
+/// are already resident from the load-on-open.
 
 #[derive(Debug, Clone)]
 pub struct UserInput { pub text: String /* future: attachments */ }
@@ -1332,6 +1369,10 @@ pub(crate) enum Command {
     Rewind   { req: RewindRequest, reply: oneshot::Sender<Result<RewindReport>> },
     Notify   { notice: Notice },
     Rename   { title: String, reply: oneshot::Sender<Result<()>> },
+    SetProvider { provider: Option<String>, model: Option<String>, reply: oneshot::Sender<Result<()>> },
+    History  { reply: oneshot::Sender<Result<Vec<HistoryTurn>>> },
+    ListBackground { reply: oneshot::Sender<Result<Vec<BackgroundTicket>>> },
+    CancelBackground { id: String, reply: oneshot::Sender<Result<bool>> },
     Background { ticket: BackgroundTicket, fut: BoxFuture<'static, Result<BackgroundResult, String>>,
                  token: CancellationToken },
     Close    { reply: oneshot::Sender<Result<()>> },
@@ -1351,7 +1392,8 @@ SessionActor::run(mut self):
   loop {
     select! {
       biased;
-      Some(res) = self.background.join_next()  → route to on_notice(BackgroundFinished|Failed)
+      Some((ticket,res)) = self.background.join_next()
+        → self.active_background.remove(&ticket.id); route to on_notice(BackgroundFinished|Failed)
       cmd = self.rx.recv() → match cmd {
         None | Close         → break (after draining queue? no: queued submits are dropped, with Notice::Info)
         Submit{input,reply}  → id = next_turn(); queue.push_back((id, User(fold_notices(input)))); reply.send(Ok(id))
@@ -1359,8 +1401,17 @@ SessionActor::run(mut self):
         Cancel{..}           → (idle) no-op; drop_queue → queue.clear()
         Notify{n}            → on_notice(n)
         Rewind{req,reply}    → reply.send(self.rewind(req).await)        // idle only; running ⇒ queued like a turn
-        Rename{..}           → persister.rename
-        Background{..}       → self.background.spawn(ticket, fut, token)
+        Rename{title,reply}  → persister.rename(title); self.meta.title = Some(title); emit TitleSet; reply.send(Ok(()))
+        SetProvider{p,m,reply} → persister.update_provider(p,m); self.meta.{provider,model} = (p,m);
+                                  emit ProviderChanged{p,m}; reply.send(Ok(()))
+        History{reply}       → reply.send(Ok(self.render_history()))   // pure in-memory render, see §9
+        ListBackground{reply}→ reply.send(Ok(self.active_background.values().map(|(t,_)| t.clone()).collect()))
+        CancelBackground{id,reply} → match self.active_background.remove(&id) {
+                                        Some((_,tok)) => { tok.cancel(); reply.send(Ok(true)) }
+                                        None          => reply.send(Ok(false))
+                                      }
+        Background{ticket,fut,token} → self.active_background.insert(ticket.id.clone(), (ticket.clone(), token.clone()));
+                                        self.background.spawn(ticket, fut, token)
       }
     }
     while let Some((id, input)) = queue.pop_front() {

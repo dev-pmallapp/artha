@@ -241,7 +241,8 @@ pub struct CloudSession {
 }
 
 #[serde(default)]
-pub struct Preferences { pub log_level: Option<String>, pub permission_mode: PermissionMode, pub checkpoints_enabled: bool /* default true */ }
+pub struct Preferences { pub log_level: Option<String>, pub permission_mode: PermissionMode, pub checkpoints_enabled: bool /* default true */,
+                          pub theme: Option<String> /* "dark" | "light" | "auto" (default); artha-tui owns the token palette */ }
 #[serde(rename_all = "snake_case")] pub enum PermissionMode { #[default] Ask, Skip }
 
 #[serde(transparent)] pub struct Secret(String);   // Debug => "Secret(***)"

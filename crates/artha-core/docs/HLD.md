@@ -87,9 +87,10 @@ The crate that *calls* tools owns their interface, and every tool source
 | `Agent`, `AgentBuilder` | shared engine (provider, tools, stores, config); cheap `Clone` | `artha-cli`, `artha-jobs` |
 | `AgentConfig`, `LoopLimits`, `DispatchConfig`, `PermissionMode` (re-export), `BackgroundFollowup` | configuration | `artha-cli` (from settings + flags), `artha-jobs` |
 | `SessionSelector` (`New`, `Continue`, `Resume(id)`) | how to open a session | `artha-cli` (`-c`, `-r`) |
-| `SessionHandle` | per-session control: `submit`, `cancel`, `retry`, `rewind`, `notify`, `close` | `artha-tui`, `artha ask`, `artha-jobs` |
+| `SessionHandle` | per-session control: `submit`, `cancel`, `retry`, `rewind`, `notify`, `rename`, `set_provider`, `history`, `list_background`, `cancel_background`, `close` | `artha-tui`, `artha ask`, `artha-jobs` |
 | `EventReceiver` (`Stream<Item = CoreEvent>`) | outward event stream | `artha-tui`, `artha ask` |
-| `CoreEvent` and its payload types (`TurnOutcome`, `ToolCallView`, `ToolOutcome`, `PermissionPrompt`, `Notice`, …) | event model (serde) | UIs, `ask --json` |
+| `CoreEvent` and its payload types (`TurnOutcome`, `ToolCallView`, `ToolOutcome`, `PermissionPrompt`, `Notice`, `TitleSet`, `ProviderChanged`, …) | event model (serde) | UIs, `ask --json` |
+| `HistoryTurn` | in-memory transcript render, for resume and `/rewind` target pickers | `artha-tui` |
 | `PermissionResponder`, `PermissionDecision` | answer to a permission prompt | UIs |
 | `run_turn_headless` | one-shot convenience: open, submit, drain, close | `artha ask`, `artha-jobs` |
 | `SessionInfo`, `list_sessions` | session picker data for `--resume` | `artha-tui`, `artha-cli` |
@@ -330,7 +331,10 @@ All `SessionStore` calls are synchronous. Core runs them on
   this.
 - **Provider and model may change on resume.** The history is
   provider-neutral by `artha-llm`'s design. The session row keeps its
-  creation-time provider; see the open item in §11.
+  creation-time provider until explicitly changed via
+  `SessionHandle::set_provider` (the `/model` command), which persists
+  through `artha-data`'s `SessionStore::update_provider` and emits
+  `CoreEvent::ProviderChanged`.
 
 ### 6.4 Repair on load
 
