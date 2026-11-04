@@ -1,0 +1,53 @@
+[package]
+name = "artha-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Settings file I/O, SQLite persistence, and the checkpoint git repository for Artha"
+# `std::fs::File::lock` / `try_lock` (advisory file locks) were stabilized in Rust 1.89.
+rust-version = "1.89"
+
+[features]
+default = ["async"]
+# `Db::call` — run a closure against the connection on tokio's blocking pool.
+async = ["dep:tokio"]
+# Exposes `artha_data::testing` (temp-dir backed `TestEnv`, schema assertions)
+# to sibling crates' test suites.
+test-util = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# SQLite. `bundled` compiles SQLite in (static binary goal, FTS5 + JSON available
+# regardless of system lib); `backup` for pre-migration snapshots of artha.db;
+# `serde_json` for ToSql/FromSql on serde_json::Value.
+# Version verified via `cargo search` on 2026-11-04.
+rusqlite = { version = "0.41", features = ["bundled", "backup", "serde_json"] }
+
+# libgit2 bindings for the checkpoint repo. Network transports (https/ssh) are
+# not needed — the snapshot repo is purely local — so default features are off.
+# `vendored-libgit2` builds libgit2 statically (no system libgit2 dependency).
+# Version verified via `cargo search` on 2026-11-04; feature names should be
+# re-checked against the 0.21 changelog when implementing.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+
+# Atomic file replacement (write to sibling temp file, fsync, rename).
+tempfile = "3.27"
+# Home-directory discovery for `~/.artha` (cross-platform).
+dirs = "6"  # unverified: believed current major as of 2026; confirm when implementing
+# Stable workdir hash for `snapshot/<hash>/` and migration checksums.
+sha2 = "0.11"
+# Time-sortable (v7) session identifiers.
+uuid = { version = "1.29", features = ["v7", "serde"] }
+# Validated `base_url` in the LLM connector config.
+url = { version = "2.5", features = ["serde"] }
+
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { workspace = true }
