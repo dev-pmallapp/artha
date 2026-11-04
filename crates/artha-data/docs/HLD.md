@@ -106,7 +106,7 @@ Out of scope:
   ledger).
 - **automation** owns namespace `monitor`.
 - Each exports a `MigrationSet` and a repository struct over `Db`, and
-  calls `db.call(...)` from its async `Tool::run`.
+  calls `db.call(...)` from its async `Tool::execute`.
 - **File-editing tools** wrap every write in
   `checkpoints.begin_edit(ctx, &[path])? … guard.finish()?`.
 

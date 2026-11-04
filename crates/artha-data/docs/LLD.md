@@ -591,6 +591,11 @@ impl SessionStore {
     pub fn list(&self, f: &SessionFilter) -> Result<Vec<SessionSummary>>;   // --resume
     pub fn rename(&self, id: SessionId, title: Option<&str>) -> Result<()>;
     pub fn set_archived(&self, id: SessionId, archived: bool) -> Result<()>;
+    // `artha-core` calls this after a provider/model switch mid-session (e.g. a
+    // user `/model` command) and after any metadata patch it wants persisted —
+    // there was previously no way to update a session after `create`.
+    pub fn update_provider(&self, id: SessionId, provider: Option<&str>, model: Option<&str>) -> Result<()>;
+    pub fn merge_metadata(&self, id: SessionId, patch: serde_json::Value) -> Result<()>; // shallow object merge
     pub fn delete(&self, id: SessionId) -> Result<()>;
     pub fn append(&self, id: SessionId, msgs: &[NewMessage]) -> Result<Vec<StoredMessage>>; // one IMMEDIATE tx
     pub fn messages(&self, id: SessionId) -> Result<Vec<StoredMessage>>;
@@ -637,6 +642,18 @@ pub struct Checkpoint { pub id, pub parent: Option<CheckpointId>, pub kind, pub 
                         pub session_id: Option<SessionId>, pub tool_call_id: Option<String>, pub tool_name: Option<String>,
                         pub files: Vec<PathBuf>, pub skipped: Vec<PathBuf>, pub created_at: Timestamp }
 pub struct CheckpointFilter { pub session_id: Option<SessionId>, pub path: Option<PathBuf>, pub limit: usize }
+// `All` means "every path present (as content or as a tombstone) in the
+// TARGET checkpoint's own tree" — not the union of every path ever touched
+// across the whole checkpoint history. Restoring an early checkpoint with
+// `All` therefore never deletes a file that was first touched in a *later*
+// checkpoint (that file simply isn't part of this checkpoint's tree, so it's
+// left alone). To roll several files back to their own distinct original
+// baselines in one "undo everything" operation, the caller (`artha-core`)
+// loops per file: look up each path's own earliest `PreEdit` checkpoint via
+// `list(CheckpointFilter { path: Some(path), .. })` (oldest first), then call
+// `restore(that_checkpoint_id, &RestoreScope::Files(vec![path]))` for it. A
+// single shared `restore(id, All)` call is only correct when every file of
+// interest was already present in that one checkpoint's tree.
 pub enum RestoreScope { All, Files(Vec<PathBuf>) }
 pub struct RestoreReport { pub restored: Vec<PathBuf>, pub deleted: Vec<PathBuf>, pub safety_checkpoint: Option<CheckpointId> }
 pub enum ChangeStatus { Added, Modified, Deleted }
