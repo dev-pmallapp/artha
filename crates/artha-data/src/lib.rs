@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Design-phase skeleton: bodies are `todo!()`. Remove once implemented.
+#![allow(unused_variables, dead_code, unused_imports)]
 
 pub mod checkpoint;
 pub mod db;
