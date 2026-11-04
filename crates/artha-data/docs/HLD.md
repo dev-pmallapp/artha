@@ -107,8 +107,12 @@ Out of scope:
 - **automation** owns namespace `monitor`.
 - Each exports a `MigrationSet` and a repository struct over `Db`, and
   calls `db.call(...)` from its async `Tool::execute`.
-- **File-editing tools** wrap every write in
-  `checkpoints.begin_edit(ctx, &[path])? … guard.finish()?`.
+- **File-editing tools never call `checkpoints.begin_edit` directly** —
+  that's `artha-core`'s policy (see its checkpointing section), driven by
+  a tool declaring `ToolPlan.writes` up front and/or calling
+  `ctx.edits().before_write(&paths)` for paths discovered during
+  execution. Per `artha-tools`' own design, `report_render` is currently
+  the only tool that writes a file at all.
 
 **`artha-jobs`**
 - Owns namespace `jobs`.

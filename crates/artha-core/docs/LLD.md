@@ -186,6 +186,16 @@ pub struct ToolTraits {
     pub confirm: ConfirmOverride,
 }
 impl Default for ToolTraits { /* ReadOnly, true, Some(120s), ConfirmOverride::Default */ }
+impl ToolTraits {
+    // `#[non_exhaustive]` blocks both direct construction and `..Default::default()` struct-update
+    // syntax from outside this crate, so sibling crates (artha-tools, artha-mcp) need a real
+    // constructor rather than field-init shorthand.
+    pub fn new(risk: ToolRisk) -> Self { Self { risk, ..Default::default() } }
+    pub fn concurrency_safe(mut self, v: bool) -> Self { self.concurrency_safe = v; self }
+    pub fn serial(self) -> Self { self.concurrency_safe(false) }
+    pub fn timeout(mut self, d: Option<Duration>) -> Self { self.timeout = d; self }
+    pub fn confirm(mut self, c: ConfirmOverride) -> Self { self.confirm = c; self }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1437,7 +1447,11 @@ SessionActor::run(mut self):
 per pending notice, *before* the user's text. Each block reads
 `"[Background task {id} \"{label}\" finished]\n{summary}"`. The
 pending list is then cleared, and the ticket ids are recorded in
-`MessageMeta.notices`.
+`MessageMeta.notices`. It also appends one `Text("[{id}] {text}")` block
+per non-empty `PromptContributor::contribute_context` result (§11),
+*after* the background-notice blocks and still before the user's own
+text — this is how per-turn, relevance-dependent context (memory recall,
+etc.) reaches the model without ever touching the cached system prompt.
 
 ## 9. Checkpoint integration (`checkpoint.rs`)
 
@@ -1607,15 +1621,33 @@ summary cap (4 KiB) keeps a chatty job from flooding the next request.
 pub trait PromptContributor: Send + Sync + 'static {
     /// Stable id for ordering and logs, e.g. "memory".
     fn id(&self) -> &str;
-    /// Called once per turn (not per round). Return None to contribute nothing. Must be fast (<100 ms);
-    /// it runs under a 500 ms timeout, and a timeout or Err only drops the section (warn log).
-    async fn contribute(&self, inputs: &PromptInputs<'_>) -> Result<Option<String>, String>;
+
+    /// System-prompt section. Called once per SESSION OPEN (and after an explicit
+    /// `refresh_system_prompt`, e.g. after a `memory_save`), never per turn, and must
+    /// NOT depend on that turn's user text — anything relevance-dependent belongs in
+    /// `contribute_context` instead. This keeps the system prompt (and therefore the
+    /// provider-side prompt-cache prefix) stable across a whole session rather than
+    /// invalidating it on every turn. Return None to contribute nothing.
+    /// Runs under a 500 ms timeout; a timeout or Err only drops the section (warn log).
+    async fn contribute(&self, inputs: &PromptInputs<'_>) -> Result<Option<String>, String> {
+        let _ = inputs;
+        Ok(None)
+    }
+
+    /// Per-turn, relevance-dependent context (e.g. memory entries matching this turn's
+    /// text). Folded into the NEXT USER MESSAGE by `fold_notices` (§4.3), the same way a
+    /// background-task notice is — never into the system prompt — so it varies turn to
+    /// turn without busting the cached prefix. Default: no per-turn context.
+    async fn contribute_context(&self, inputs: &PromptInputs<'_>) -> Result<Option<String>, String> {
+        let _ = inputs;
+        Ok(None)
+    }
 }
 
 pub struct PromptInputs<'a> {
     pub session_id: Option<data::SessionId>,
     pub workdir: &'a Path,
-    pub user_text: &'a str,          // this turn's user text, for relevance-based recall
+    pub user_text: &'a str,          // only meaningful for contribute_context
     pub tool_names: &'a [String],
     pub today: data::Timestamp,
 }
@@ -1623,7 +1655,8 @@ pub struct PromptInputs<'a> {
 pub(crate) struct SystemPromptBuilder { base: Cow<'static, str>, contributors: Vec<Arc<dyn PromptContributor>> }
 impl SystemPromptBuilder {
     /// base + "\n\n## Environment\n- Date: …\n- Working directory: …\n- Mode: …"
-    ///      + one "## {id}" section per contributor (sorted by id, for a stable prefix).
+    ///      + one "## {id}" section per contributor's `contribute()` (sorted by id, for
+    ///      a stable prefix). Cached on the session; rebuilt only on open or an explicit refresh.
     pub(crate) async fn build(&self, inputs: &PromptInputs<'_>) -> String;
 }
 ```
@@ -1633,6 +1666,15 @@ stable within a day. The base prompt is compiled in
 (`include_str!("prompt/base.md")`; the file is created in the
 implementation pass) and states Artha's finance-assistant role, its
 tool-use etiquette, and the "not financial advice" framing.
+
+Before building a turn's user message, the actor calls
+`contribute_context` on every registered contributor (same 500 ms-timeout,
+drop-on-error policy as `contribute`) and passes the non-empty results into
+`fold_notices` alongside any pending background notices, each as its own
+`"[{id}] {text}"` block ahead of the user's own text. Memory recall is the
+first consumer: it implements `contribute` for stable, pinned facts (a
+user's name, standing preferences) and `contribute_context` for anything
+selected by matching `inputs.user_text` against `memory_entry_fts`.
 
 ## 12. Configuration (`config.rs`)
 

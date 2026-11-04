@@ -292,6 +292,12 @@ impl Db {
     #[cfg(feature = "async")]
     pub async fn call<R: Send + 'static, E: From<DataError> + Send + 'static>(
         &self, f: impl FnOnce(&Transaction<'_>) -> Result<R, E> + Send + 'static) -> Result<R, E>; // spawn_blocking(write)
+    /// Read-only counterpart to `call` — DEFERRED, not IMMEDIATE, so a read-heavy async
+    /// tool (memory_search, a portfolio report) doesn't take the RESERVED lock other
+    /// processes' writers need. `call` originally had no read variant at all.
+    #[cfg(feature = "async")]
+    pub async fn call_read<R: Send + 'static, E: From<DataError> + Send + 'static>(
+        &self, f: impl FnOnce(&Transaction<'_>) -> Result<R, E> + Send + 'static) -> Result<R, E>; // spawn_blocking(read)
     pub fn applied_migrations(&self) -> Result<Vec<AppliedMigration>>;
     pub fn health_check(&self) -> Result<Vec<String>>;  // integrity_check + foreign_key_check
     pub fn migrate_additional(&self, schemas: &[&'static MigrationSet]) -> Result<MigrationReport>;
@@ -315,8 +321,8 @@ impl Db {
 - **Cross-process waits are bounded by `busy_timeout`.** When it expires,
   the caller gets `DataError::Sqlite(SQLITE_BUSY)` and `is_busy()` returns
   true.
-- **Async callers** use `call`. It clones the `Arc` into
-  `spawn_blocking`. A `JoinError` becomes `DataError::TaskJoin`.
+- **Async callers** use `call` (write) or `call_read` (read). Both clone
+  the `Arc` into `spawn_blocking`. A `JoinError` becomes `DataError::TaskJoin`.
 - **Why not a pool:** see HLD §5.5. If read latency under a long-running
   writer ever matters, the upgrade path is to add N read-only connections
   behind `read` and keep the single writer. The public API doesn't change.
@@ -326,6 +332,16 @@ impl Db {
 `journal_mode=WAL` (file-backed only), `synchronous=NORMAL`,
 `foreign_keys=ON`, `busy_timeout=<opts>`, `temp_store=MEMORY`,
 `trusted_schema=OFF`.
+
+`trusted_schema=OFF` is a deliberate hardening default and applies to
+every sibling crate's migrations, not just core's. A sibling owning an
+FTS5 external-content table (e.g. artha-tools' `memory_entry_fts`, synced
+by plain triggers on `memory_entry`) should not assume compatibility —
+FTS5's own sync triggers are core-extension-backed rather than
+user-defined, so they're expected to work, but that sibling's own
+migration tests should assert it directly (with a documented fallback —
+e.g. rebuilding the index from `memory_entry` on mismatch — if it ever
+doesn't) rather than this crate silently carving out an exception.
 
 ### 5.4 Migrations (`migrate/`)
 
